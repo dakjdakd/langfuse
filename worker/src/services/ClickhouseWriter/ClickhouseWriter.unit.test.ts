@@ -227,6 +227,70 @@ describe("ClickhouseWriter", () => {
     );
   });
 
+  it("isolates writer clients and explicit table destinations", async () => {
+    const firstClient = { insert: vi.fn().mockResolvedValue(undefined) };
+    const secondClient = { insert: vi.fn().mockResolvedValue(undefined) };
+    const firstWriter = new ClickhouseWriter({
+      client: firstClient as any,
+      tableNames: { [TableName.EventsFull]: "first_events" },
+    });
+    const secondWriter = new ClickhouseWriter({
+      client: secondClient as any,
+      tableNames: { [TableName.EventsFull]: "second_events" },
+    });
+
+    try {
+      expect(() =>
+        firstWriter.addToQueue(TableName.Traces, { id: "not-allowed" } as any),
+      ).toThrow(/no destination configured/i);
+      expect(firstWriter.queue[TableName.Traces]).toHaveLength(0);
+
+      firstWriter.addToQueue(TableName.EventsFull, { id: "first" } as any);
+      secondWriter.addToQueue(TableName.EventsFull, { id: "second" } as any);
+      await Promise.all([firstWriter.shutdown(), secondWriter.shutdown()]);
+
+      expect(firstClient.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ table: "first_events" }),
+      );
+      expect(secondClient.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ table: "second_events" }),
+      );
+      expect(clickhouseClientMock.insert).not.toHaveBeenCalled();
+    } finally {
+      await Promise.all([firstWriter.shutdown(), secondWriter.shutdown()]);
+    }
+  });
+
+  it("waits for an in-flight batch insert before shutdown completes", async () => {
+    let resolveInsert!: () => void;
+    const mockInsert = vi
+      .spyOn(clickhouseClientMock, "insert")
+      .mockImplementation(
+        () => new Promise<void>((resolve) => (resolveInsert = resolve)),
+      );
+    writer.batchSize = 1;
+    writer.addToQueue(TableName.Traces, { id: "1", name: "trace" } as any);
+
+    let shutdown: Promise<void> | undefined;
+    try {
+      await vi.waitFor(() => expect(mockInsert).toHaveBeenCalledTimes(1));
+      let shutdownComplete = false;
+      shutdown = writer.shutdown().then(() => {
+        shutdownComplete = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(shutdownComplete).toBe(false);
+
+      resolveInsert();
+      await shutdown;
+      expect(shutdownComplete).toBe(true);
+    } finally {
+      resolveInsert?.();
+      await shutdown;
+    }
+  });
+
   it("should handle multiple table types", async () => {
     const mockInsert = vi
       .spyOn(clickhouseClientMock, "insert")

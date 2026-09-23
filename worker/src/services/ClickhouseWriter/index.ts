@@ -35,7 +35,9 @@ const MULTI_PROJECT_LOG_COMMENT_PROJECT_ID = "MULTI_PROJECT";
 
 export class ClickhouseWriter {
   private static instance: ClickhouseWriter | null = null;
-  private static client: ClickhouseClientType | null = null;
+  private client: ClickhouseClientType | null;
+  private readonly tableNames: Partial<Record<TableName, string>>;
+  private readonly activeFlushes = new Set<Promise<void>>();
   batchSize: number;
   writeInterval: number;
   maxAttempts: number;
@@ -44,7 +46,15 @@ export class ClickhouseWriter {
   isIntervalFlushInProgress: boolean;
   intervalId: NodeJS.Timeout | null = null;
 
-  private constructor() {
+  public constructor(options: ClickhouseWriterOptions = {}) {
+    this.client = options.client ?? null;
+    this.tableNames =
+      options.tableNames === undefined
+        ? Object.fromEntries(
+            Object.values(TableName).map((tableName) => [tableName, tableName]),
+          )
+        : { ...options.tableNames };
+
     this.batchSize = env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_BATCH_SIZE;
     this.writeInterval = env.LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS;
     this.maxAttempts = env.LANGFUSE_INGESTION_CLICKHOUSE_MAX_ATTEMPTS;
@@ -70,12 +80,12 @@ export class ClickhouseWriter {
    * Client parameter is only used for testing.
    */
   public static getInstance(clickhouseClient?: ClickhouseClientType) {
-    if (clickhouseClient) {
-      ClickhouseWriter.client = clickhouseClient;
-    }
-
     if (!ClickhouseWriter.instance) {
-      ClickhouseWriter.instance = new ClickhouseWriter();
+      ClickhouseWriter.instance = new ClickhouseWriter({
+        client: clickhouseClient,
+      });
+    } else if (clickhouseClient) {
+      ClickhouseWriter.instance.client = clickhouseClient;
     }
 
     return ClickhouseWriter.instance;
@@ -105,32 +115,47 @@ export class ClickhouseWriter {
       this.intervalId = null;
     }
 
+    while (this.activeFlushes.size > 0) {
+      await Promise.all([...this.activeFlushes]);
+    }
+
     await this.flushAll(true);
 
     logger.info("ClickhouseWriter shutdown complete.");
   }
 
   public async flushAll(fullQueue = false) {
-    return instrumentAsync(
-      {
-        name: "write-to-clickhouse",
-      },
-      async () => {
-        recordIncrement("langfuse.queue.clickhouse_writer.request");
-        await Promise.all([
-          this.flush(TableName.Traces, fullQueue),
-          this.flush(TableName.TracesNull, fullQueue),
-          this.flush(TableName.Scores, fullQueue),
-          this.flush(TableName.Observations, fullQueue),
-          this.flush(TableName.ObservationsBatchStaging, fullQueue),
-          this.flush(TableName.BlobStorageFileLog, fullQueue),
-          this.flush(TableName.DatasetRunItems, fullQueue),
-          this.flush(TableName.EventsFull, fullQueue),
-        ]).catch((err) => {
-          logger.error("ClickhouseWriter.flushAll", err);
-        });
-      },
+    return this.trackActiveFlush(
+      instrumentAsync(
+        {
+          name: "write-to-clickhouse",
+        },
+        async () => {
+          recordIncrement("langfuse.queue.clickhouse_writer.request");
+          await Promise.all([
+            this.flush(TableName.Traces, fullQueue),
+            this.flush(TableName.TracesNull, fullQueue),
+            this.flush(TableName.Scores, fullQueue),
+            this.flush(TableName.Observations, fullQueue),
+            this.flush(TableName.ObservationsBatchStaging, fullQueue),
+            this.flush(TableName.BlobStorageFileLog, fullQueue),
+            this.flush(TableName.DatasetRunItems, fullQueue),
+            this.flush(TableName.EventsFull, fullQueue),
+          ]).catch((err) => {
+            logger.error("ClickhouseWriter.flushAll", err);
+          });
+        },
+      ),
     );
+  }
+
+  private trackActiveFlush(flush: Promise<void>): Promise<void> {
+    this.activeFlushes.add(flush);
+    flush.then(
+      () => this.activeFlushes.delete(flush),
+      () => this.activeFlushes.delete(flush),
+    );
+    return flush;
   }
 
   private isRetryableError(error: unknown): boolean {
@@ -576,6 +601,8 @@ export class ClickhouseWriter {
     tableName: T,
     data: RecordInsertType<T>,
   ) {
+    this.getDestinationTableName(tableName);
+
     const entityQueue = this.queue[tableName];
     entityQueue.push({
       createdAt: Date.now(),
@@ -586,10 +613,20 @@ export class ClickhouseWriter {
     if (entityQueue.length >= this.batchSize) {
       logger.debug(`Queue is full. Flushing ${tableName}...`);
 
-      this.flush(tableName).catch((err) => {
+      this.trackActiveFlush(this.flush(tableName)).catch((err) => {
         logger.error("ClickhouseWriter.addToQueue flush", err);
       });
     }
+  }
+
+  private getDestinationTableName(tableName: TableName): string {
+    const destination = this.tableNames[tableName];
+    if (destination === undefined) {
+      throw new Error(
+        `ClickhouseWriter has no destination configured for ${tableName}`,
+      );
+    }
+    return destination;
   }
 
   private async writeToClickhouse<T extends TableName>(params: {
@@ -597,10 +634,11 @@ export class ClickhouseWriter {
     records: RecordInsertType<T>[];
   }): Promise<void> {
     const startTime = Date.now();
+    const destinationTable = this.getDestinationTableName(params.table);
 
-    await (ClickhouseWriter.client ?? clickhouseClient())
+    await (this.client ?? clickhouseClient())
       .insert({
-        table: params.table,
+        table: destinationTable,
         format: "JSONEachRow",
         values: params.records,
         clickhouse_settings: {
@@ -635,6 +673,12 @@ export enum TableName {
   DatasetRunItems = "dataset_run_items_rmt",
   EventsFull = "events_full", // Primary write target - MV auto-populates events_core
 }
+
+type ClickhouseWriterOptions = {
+  client?: ClickhouseClientType;
+  /** Omit for normal table destinations; supplied maps are complete for this instance. */
+  tableNames?: Partial<Record<TableName, string>>;
+};
 
 type RecordInsertType<T extends TableName> = T extends TableName.Scores
   ? ScoreRecordInsertType
